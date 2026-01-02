@@ -9,19 +9,29 @@ from typing import Dict, List, Tuple, Any
 
 import pandas as pd
 import aiohttp
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, BasicAuth
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from deepdiff import DeepDiff
+from dotenv import load_dotenv
+from auth import get_password
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
+
+# Load environment variables
+load_dotenv()
+
 INPUT_FILE = "shared/reports/pl_testcases.xlsx"
 OUTPUT_DIR = "shared/reports"
 SOURCE_RESPONSE_DIR = "shared/reports/source_api"
 TARGET_RESPONSE_DIR = "shared/reports/target_api"
 REPORT_FILE = "shared/reports/report.xlsx"
+
+# Authentication credentials
+USERNAME = os.getenv("USERNAME", os.getenv("API_USERNAME", ""))
+PASSWORD = None  # Will be loaded at runtime
 
 # Performance settings
 MAX_CONCURRENT_REQUESTS = 50  # Adjust based on system capacity
@@ -29,9 +39,9 @@ REQUEST_TIMEOUT = 30  # seconds
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 1  # seconds
 
-# ⚠️ TESTING LIMIT - Process only first N test cases (for authentication testing)
+# TESTING LIMIT - Process only first N test cases (for authentication testing)
 # Set to None to process ALL test cases, or set to a number (e.g., 1000) to limit
-LIMIT_TEST_CASES = 1000  # 🔧 CHANGE TO None TO PROCESS ALL TEST CASES
+LIMIT_TEST_CASES = 100  # CHANGE TO None TO PROCESS ALL TEST CASES
 
 # =====================================================
 # UTILITY FUNCTIONS
@@ -42,7 +52,7 @@ def create_directories():
     Path(SOURCE_RESPONSE_DIR).mkdir(parents=True, exist_ok=True)
     Path(TARGET_RESPONSE_DIR).mkdir(parents=True, exist_ok=True)
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-    print("✓ Directories created successfully")
+    print("[OK] Directories created successfully")
 
 
 def get_safe_filename(url: str, index: int) -> str:
@@ -96,7 +106,7 @@ def compare_json(source_data: Any, target_data: Any) -> Tuple[bool, str]:
         
         if 'values_changed' in diff:
             for key, change in list(diff['values_changed'].items())[:5]:  # Limit to first 5
-                mismatch_parts.append(f"Value changed at {key}: {change['old_value']} → {change['new_value']}")
+                mismatch_parts.append(f"Value changed at {key}: {change['old_value']} -> {change['new_value']}")
         
         if 'dictionary_item_added' in diff:
             added = list(diff['dictionary_item_added'])[:5]
@@ -108,7 +118,7 @@ def compare_json(source_data: Any, target_data: Any) -> Tuple[bool, str]:
         
         if 'type_changes' in diff:
             for key, change in list(diff['type_changes'].items())[:3]:
-                mismatch_parts.append(f"Type changed at {key}: {change['old_type']} → {change['new_type']}")
+                mismatch_parts.append(f"Type changed at {key}: {change['old_type']} -> {change['new_type']}")
         
         if 'iterable_item_added' in diff:
             mismatch_parts.append("Array items added in target")
@@ -153,21 +163,22 @@ class ProgressTracker:
                 eta_str = "ETA: calculating..."
             
             # Print progress
-            sys.stdout.write(f"\r⏳ Processing: {percentage:.1f}% ({self.completed}/{self.total}) | {eta_str}")
+            sys.stdout.write(f"\rProcessing: {percentage:.1f}% ({self.completed}/{self.total}) | {eta_str}")
             sys.stdout.flush()
     
     def finish(self):
         """Print final statistics."""
         elapsed = time.time() - self.start_time
-        print(f"\n✓ Total execution time: {elapsed:.2f} seconds")
-        print(f"✓ Average request time: {elapsed/self.total:.3f} seconds")
+        print(f"\n[OK] Total execution time: {elapsed:.2f} seconds")
+        print(f"[OK] Average request time: {elapsed/self.total:.3f} seconds")
 
 
 async def fetch_json_with_retry(
     session: ClientSession,
     url: str,
     semaphore: asyncio.Semaphore,
-    progress: ProgressTracker
+    progress: ProgressTracker,
+    auth: BasicAuth = None
 ) -> Dict[str, Any]:
     """
     Fetch JSON from URL with retry logic.
@@ -178,7 +189,7 @@ async def fetch_json_with_retry(
     async with semaphore:
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                async with session.get(url, timeout=ClientTimeout(total=REQUEST_TIMEOUT)) as response:
+                async with session.get(url, auth=auth, timeout=ClientTimeout(total=REQUEST_TIMEOUT)) as response:
                     status_code = response.status
                     
                     if status_code == 200:
@@ -260,7 +271,8 @@ async def process_test_case(
     index: int,
     source_url: str,
     target_url: str,
-    progress: ProgressTracker
+    progress: ProgressTracker,
+    auth: BasicAuth = None
 ) -> Dict[str, Any]:
     """
     Process a single test case: fetch both URLs and compare.
@@ -269,8 +281,8 @@ async def process_test_case(
         Dict with all test results
     """
     # Fetch source and target in parallel
-    source_task = fetch_json_with_retry(session, source_url, semaphore, progress)
-    target_task = fetch_json_with_retry(session, target_url, semaphore, progress)
+    source_task = fetch_json_with_retry(session, source_url, semaphore, progress, auth)
+    target_task = fetch_json_with_retry(session, target_url, semaphore, progress, auth)
     
     source_result, target_result = await asyncio.gather(source_task, target_task)
     
@@ -332,6 +344,14 @@ async def run_regression_tests(test_cases: pd.DataFrame) -> List[Dict[str, Any]]
     
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
+    # Create authentication object
+    auth = None
+    if USERNAME and PASSWORD:
+        auth = BasicAuth(USERNAME, PASSWORD)
+        print(f"[OK] Using authentication for user: {USERNAME}")
+    else:
+        print("[WARNING] No authentication configured. Requests may fail.")
+    
     # Configure session with connection pooling
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, limit_per_host=20)
     timeout = ClientTimeout(total=REQUEST_TIMEOUT)
@@ -349,7 +369,8 @@ async def run_regression_tests(test_cases: pd.DataFrame) -> List[Dict[str, Any]]
                 index=idx,
                 source_url=source_url,
                 target_url=target_url,
-                progress=progress
+                progress=progress,
+                auth=auth
             )
             tasks.append(task)
         
@@ -372,7 +393,7 @@ def generate_excel_report(results: List[Dict[str, Any]], output_file: str):
         results: List of test results
         output_file: Path to output Excel file
     """
-    print("\n📊 Generating Excel report...")
+    print("\nGenerating Excel report...")
     
     # Create DataFrame
     report_data = []
@@ -422,7 +443,7 @@ def generate_excel_report(results: List[Dict[str, Any]], output_file: str):
             else:
                 status_cell.fill = red_fill
     
-    print(f"✓ Report generated: {output_file}")
+    print(f"[OK] Report generated: {output_file}")
 
 
 # =====================================================
@@ -431,22 +452,37 @@ def generate_excel_report(results: List[Dict[str, Any]], output_file: str):
 
 def main():
     """Main execution function."""
+    global PASSWORD
+    
     print("=" * 80)
     print("API REGRESSION TESTING FRAMEWORK")
     print("=" * 80)
     
     start_time = time.time()
     
+    # Load password from auth.py
+    try:
+        PASSWORD = get_password()
+        print(f"\n[OK] Password loaded successfully")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to load password: {e}")
+        print("[WARNING] Continuing without authentication - API calls may fail")
+    
+    # Validate credentials
+    if not USERNAME:
+        print("[WARNING] USERNAME not found in .env file")
+        print("[WARNING] Set USERNAME or API_USERNAME in .env file")
+    
     # Step 1: Create directories
-    print("\n📁 Step 1: Setting up directories...")
+    print("\nStep 1: Setting up directories...")
     create_directories()
     
     # Step 2: Load test cases
-    print(f"\n📥 Step 2: Loading test cases from {INPUT_FILE}...")
+    print(f"\nStep 2: Loading test cases from {INPUT_FILE}...")
     
     if not os.path.exists(INPUT_FILE):
-        print(f"❌ Error: Input file not found: {INPUT_FILE}")
-        print("💡 Please run pl_generateTestCase.py first to generate the test cases.")
+        print(f"[ERROR] Input file not found: {INPUT_FILE}")
+        print("Please run pl_generateTestCase.py first to generate the test cases.")
         sys.exit(1)
     
     test_cases = pd.read_excel(INPUT_FILE)
@@ -455,24 +491,24 @@ def main():
     missing_columns = [col for col in required_columns if col not in test_cases.columns]
     
     if missing_columns:
-        print(f"❌ Error: Missing required columns: {missing_columns}")
+        print(f"[ERROR] Missing required columns: {missing_columns}")
         sys.exit(1)
     
     # Apply test case limit if configured
     total_available = len(test_cases)
     if LIMIT_TEST_CASES is not None and LIMIT_TEST_CASES < total_available:
         test_cases = test_cases.head(LIMIT_TEST_CASES)
-        print(f"⚠️  WARNING: LIMIT_TEST_CASES is active!")
-        print(f"⚠️  Processing only first {LIMIT_TEST_CASES} of {total_available} test cases")
-        print(f"⚠️  Set LIMIT_TEST_CASES = None to process all test cases")
+        print(f"[WARNING] LIMIT_TEST_CASES is active!")
+        print(f"[WARNING] Processing only first {LIMIT_TEST_CASES} of {total_available} test cases")
+        print(f"[WARNING] Set LIMIT_TEST_CASES = None to process all test cases")
         print()
     
-    print(f"✓ Loaded {len(test_cases)} test cases")
-    print(f"✓ Total API requests to be made: {len(test_cases) * 2}")
+    print(f"[OK] Loaded {len(test_cases)} test cases")
+    print(f"[OK] Total API requests to be made: {len(test_cases) * 2}")
     
     # Step 3: Run regression tests
-    print(f"\n🚀 Step 3: Executing API regression tests...")
-    print(f"⚙️  Configuration:")
+    print(f"\nStep 3: Executing API regression tests...")
+    print(f"Configuration:")
     print(f"   - Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
     print(f"   - Request timeout: {REQUEST_TIMEOUT}s")
     print(f"   - Retry attempts: {RETRY_ATTEMPTS}")
@@ -481,26 +517,26 @@ def main():
     results = asyncio.run(run_regression_tests(test_cases))
     
     # Step 4: Generate report
-    print(f"\n📝 Step 4: Generating final report...")
+    print(f"\nStep 4: Generating final report...")
     generate_excel_report(results, REPORT_FILE)
     
     # Step 5: Summary
     print("\n" + "=" * 80)
-    print("📊 TEST SUMMARY")
+    print("TEST SUMMARY")
     print("=" * 80)
     
     matched_count = sum(1 for r in results if r['status'] == "Matched")
     failed_count = len(results) - matched_count
     
-    print(f"✓ Total Test Cases: {len(results)}")
-    print(f"✓ Matched: {matched_count} ({matched_count/len(results)*100:.1f}%)")
-    print(f"✗ Mismatched/Failed: {failed_count} ({failed_count/len(results)*100:.1f}%)")
-    print(f"\n📁 Source API Responses: {SOURCE_RESPONSE_DIR}")
-    print(f"📁 Target API Responses: {TARGET_RESPONSE_DIR}")
-    print(f"📄 Final Report: {REPORT_FILE}")
+    print(f"Total Test Cases: {len(results)}")
+    print(f"Matched: {matched_count} ({matched_count/len(results)*100:.1f}%)")
+    print(f"Mismatched/Failed: {failed_count} ({failed_count/len(results)*100:.1f}%)")
+    print(f"\nSource API Responses: {SOURCE_RESPONSE_DIR}")
+    print(f"Target API Responses: {TARGET_RESPONSE_DIR}")
+    print(f"Final Report: {REPORT_FILE}")
     
     total_time = time.time() - start_time
-    print(f"\n⏱️  Total execution time: {total_time:.2f} seconds")
+    print(f"\nTotal execution time: {total_time:.2f} seconds")
     print("=" * 80)
 
 
